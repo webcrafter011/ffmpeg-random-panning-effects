@@ -2,13 +2,12 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const INPUT_FOLDER = "input"; // Folder containing images
-const OUTPUT_VIDEO = "final_output.mp4"; // Final output video
-const TEMP_VIDEO = "temp_output.mp4"; // Temporary file to hold the final video
-const DURATION_PER_IMAGE = 4; // Duration per image (seconds)
-const FRAME_RATE = 30; // FPS
-const RESOLUTION = "1920x1080"; // Video resolution
-const TEMP_CLIP = "output_single.mp4"; // Temporary video for each image
+const INPUT_FOLDER = "input";
+const OUTPUT_VIDEO = "final_output.mp4";
+const TEMP_FOLDER = "temp";
+const DURATION_PER_IMAGE = 4;
+const FRAME_RATE = 30;
+const RESOLUTION = "1920x1080";
 
 const DIRECTIONS = [
   "left-to-right",
@@ -17,28 +16,39 @@ const DIRECTIONS = [
   "bottom-to-top",
 ];
 
-const processImage = (inputFile) => {
+// Create temp folder if not exists
+if (!fs.existsSync(TEMP_FOLDER)) {
+  fs.mkdirSync(TEMP_FOLDER);
+}
+
+// Remove progress bar setup and variables
+let totalProgress = 0;
+let currentFileIndex = 0;
+let totalFiles = 0;
+
+const processImage = (inputFile, index, totalImages) => {
   return new Promise((resolve, reject) => {
     const direction = DIRECTIONS[Math.floor(Math.random() * DIRECTIONS.length)];
-    const totalFrames = DURATION_PER_IMAGE * FRAME_RATE;
+    const clipFile = path.join(TEMP_FOLDER, `clip_${index}.mp4`);
+    const imageFrames = DURATION_PER_IMAGE * FRAME_RATE;
 
     let zoompanFilter = "";
     switch (direction) {
       case "left-to-right":
-        zoompanFilter = `zoompan=z=1.2:x='(iw-iw/1.2)*on/${totalFrames}':y=0:d=1:s=${RESOLUTION}`;
+        zoompanFilter = `zoompan=z=1.2:x='(iw-iw/1.2)*on/${imageFrames}':y=0:d=1:s=${RESOLUTION}`;
         break;
       case "right-to-left":
-        zoompanFilter = `zoompan=z=1.2:x='(iw-iw/1.2)*(1-on/${totalFrames})':y=0:d=1:s=${RESOLUTION}`;
+        zoompanFilter = `zoompan=z=1.2:x='(iw-iw/1.2)*(1-on/${imageFrames})':y=0:d=1:s=${RESOLUTION}`;
         break;
       case "top-to-bottom":
-        zoompanFilter = `zoompan=z=1.2:x=0:y='(ih-ih/1.2)*on/${totalFrames}':d=1:s=${RESOLUTION}`;
+        zoompanFilter = `zoompan=z=1.2:x=0:y='(ih-ih/1.2)*on/${imageFrames}':d=1:s=${RESOLUTION}`;
         break;
       case "bottom-to-top":
-        zoompanFilter = `zoompan=z=1.2:x=0:y='(ih-ih/1.2)*(1-on/${totalFrames})':d=1:s=${RESOLUTION}`;
+        zoompanFilter = `zoompan=z=1.2:x=0:y='(ih-ih/1.2)*(1-on/${imageFrames})':d=1:s=${RESOLUTION}`;
         break;
     }
 
-    console.log(`🎥 Processing ${inputFile} with ${direction} effect...`);
+    console.log(`🎥 Processing image ${index + 1}/${totalImages}...`);
 
     const ffmpeg = spawn("ffmpeg", [
       "-loop",
@@ -56,21 +66,25 @@ const processImage = (inputFile) => {
       "-pix_fmt",
       "yuv420p",
       "-y",
-      TEMP_CLIP,
+      clipFile,
     ]);
 
-    ffmpeg.stderr.on("data", (data) => process.stdout.write(data.toString()));
+    ffmpeg.stderr.on("data", (data) => {
+      const output = data.toString();
+      const match = output.match(/frame=\s*(\d+)/);
+      if (match) {
+        const currentFrames = parseInt(match[1], 10);
+        const fileProgress = (currentFrames / imageFrames) * 100;
+        // Calculate overall progress considering both current file and previous files
+        const overallProgress = Math.floor((currentFileIndex * 100 + fileProgress) / totalFiles);
+        console.log(`Progress: ${overallProgress}%`);
+      }
+    });
 
     ffmpeg.on("close", (code) => {
       if (code === 0) {
-        if (fs.existsSync(TEMP_CLIP)) {
-          console.log(`✅ Created video for ${inputFile}`);
-          mergeWithExistingVideo(TEMP_CLIP).then(resolve).catch(reject);
-        } else {
-          reject(
-            new Error(`FFmpeg finished but ${TEMP_CLIP} was not created.`)
-          );
-        }
+        currentFileIndex++;
+        resolve(clipFile);
       } else {
         reject(new Error(`FFmpeg exited with code ${code}`));
       }
@@ -78,68 +92,92 @@ const processImage = (inputFile) => {
   });
 };
 
-const mergeWithExistingVideo = (newClip) => {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(newClip)) {
-      reject(new Error(`Merge failed: ${newClip} does not exist.`));
-      return;
+const mergeVideos = async () => {
+  try {
+    console.log("\n🔗 Merging all generated videos...");
+
+    const videoFiles = fs
+      .readdirSync(TEMP_FOLDER)
+      .filter((file) => file.endsWith(".mp4"))
+      .map((file) => `file '${path.resolve(TEMP_FOLDER, file)}'`)
+      .join("\n");
+
+    if (!videoFiles) {
+      throw new Error("No videos found in temp folder for merging.");
     }
 
-    if (!fs.existsSync(TEMP_VIDEO)) {
-      fs.renameSync(newClip, TEMP_VIDEO);
-      resolve();
-      return;
-    }
+    const listFilePath = path.join(TEMP_FOLDER, "file_list.txt");
+    fs.writeFileSync(listFilePath, videoFiles);
 
-    console.log("🔗 Merging with existing video...");
-
-    const tempMergedVideo = "temp_merged.mp4";
     const ffmpeg = spawn("ffmpeg", [
+      "-f",
+      "concat",
+      "-safe",
+      "0",
       "-i",
-      TEMP_VIDEO,
-      "-i",
-      newClip,
-      "-filter_complex",
-      "[0:v:0][1:v:0]concat=n=2:v=1[outv]",
-      "-map",
-      "[outv]",
+      listFilePath,
       "-c:v",
       "libx264",
       "-pix_fmt",
       "yuv420p",
       "-y",
-      tempMergedVideo,
+      OUTPUT_VIDEO,
     ]);
 
-    ffmpeg.stderr.on("data", (data) => process.stdout.write(data.toString()));
+    return new Promise((resolve, reject) => {
+      ffmpeg.stderr.on("data", (data) => {
+        const output = data.toString();
+        const match = output.match(/time=(\d{2}):(\d{2}):(\d{2}.\d{2})/);
+        if (match) {
+          const [_, hours, minutes, seconds] = match;
+          const totalSeconds = (+hours) * 3600 + (+minutes) * 60 + (+seconds);
+          const totalDuration = totalFiles * DURATION_PER_IMAGE;
+          const mergeProgress = Math.floor((totalSeconds / totalDuration) * 100);
+          console.log(`Merging Progress: ${mergeProgress}%`);
+        }
+      });
 
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
-        fs.renameSync(tempMergedVideo, TEMP_VIDEO);
-        fs.unlinkSync(newClip);
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg merge failed with code ${code}`));
-      }
+      ffmpeg.on("close", (code) => {
+        if (code === 0) {
+          console.log(`✅ Final video created: ${OUTPUT_VIDEO}`);
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg merge failed with code ${code}`));
+        }
+      });
     });
-  });
+  } catch (error) {
+    console.error("❌ Error merging videos:", error);
+  }
 };
 
 const watchAndProcessImages = async () => {
   try {
-    console.log("📂 Watching folder for images...");
-    const files = fs.readdirSync(INPUT_FOLDER);
+    console.log("📂 Scanning folder for images...");
+    const files = fs
+      .readdirSync(INPUT_FOLDER)
+      .filter((file) => file.match(/\.(jpg|jpeg|png)$/i));
 
-    for (const file of files) {
-      if (file.match(/\.(jpg|jpeg|png)$/i)) {
-        const filePath = path.join(INPUT_FOLDER, file);
-        await processImage(filePath);
-      }
+    if (files.length === 0) {
+      console.log("⚠️ No images found in input folder.");
+      return;
     }
 
-    console.log("🎬 Finalizing video...");
-    fs.renameSync(TEMP_VIDEO, OUTPUT_VIDEO);
-    console.log(`✅ Final video created: ${OUTPUT_VIDEO}`);
+    totalFiles = files.length;
+    currentFileIndex = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      const filePath = path.join(INPUT_FOLDER, files[i]);
+      await processImage(filePath, i, files.length);
+    }
+
+    await mergeVideos();
+
+    // Cleanup temp folder
+    fs.readdirSync(TEMP_FOLDER).forEach((file) =>
+      fs.unlinkSync(path.join(TEMP_FOLDER, file))
+    );
+    fs.rmdirSync(TEMP_FOLDER);
   } catch (error) {
     console.error("❌ Error:", error);
   }
